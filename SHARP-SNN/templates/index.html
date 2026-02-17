@@ -1,0 +1,492 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SHARP-SNN 3D Visualizer</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; color: white; font-family: sans-serif; }
+        #info { position: absolute; top: 10px; left: 10px; pointer-events: none; }
+        #controls { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.7); padding: 10px; border-radius: 5px; }
+        button { background: #333; color: white; border: 1px solid #555; padding: 5px 10px; cursor: pointer; margin-bottom: 5px; width: 100%; }
+        button:hover { background: #444; }
+        .log-entry { font-size: 12px; color: #aaa; }
+        #logs { position: absolute; bottom: 10px; left: 10px; height: 150px; width: 300px; overflow-y: auto; background: rgba(0,0,0,0.5); padding: 5px; pointer-events: none; }
+    </style>
+    <!-- Import Map for Three.js -->
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            }
+        }
+    </script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.js"></script>
+</head>
+<body>
+    <div id="info">
+        <h1>SHARP-SNN Visualizer</h1>
+        <p>Green: Healthy | Red: Dead | Blue: Backup | Yellow: Healing</p>
+    </div>
+    <div id="controls">
+        <button id="btn-toggle">Start Simulation</button>
+        <button id="btn-reset">Reset Network</button>
+        <hr>
+        <div id="fault-controls">
+            <p>Inject Fault (Click Neuron first)</p>
+            <button onclick="injectFault('Dead')">Dead</button>
+            <button onclick="injectFault('Silent')">Silent</button>
+            <button onclick="injectFault('Hyperactive')">Hyperactive</button>
+        </div>
+        <div id="selected-neuron">Selected: None</div>
+        <div id="neuron-info" style="margin-top: 10px; font-size: 14px; color: #ddd;"></div>
+    </div>
+    <div id="logs"></div>
+    <div id="energy-container" style="position: absolute; bottom: 10px; right: 10px; width: 300px; height: 100px; background: rgba(0,0,0,0.5); padding: 5px; border-radius: 5px; pointer-events: none;">
+        <div style="font-size: 12px; color: #aaa; margin-bottom: 2px;">Energy Consumption (Spikes/Step)</div>
+        <canvas id="energy-graph" width="300" height="80"></canvas>
+    </div>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+        import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+        import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+        import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+
+        // --- Socket.IO Setup ---
+        const socket = io();
+        let isRunning = false;
+        let selectedNeuronId = null;
+
+        // --- Three.js Setup ---
+        const scene = new THREE.Scene();
+        // scene.background = new THREE.Color(0x050505);
+        scene.fog = new THREE.FogExp2(0x000000, 0.02);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.set(0, 10, 20);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        document.body.appendChild(renderer.domElement);
+
+        // --- Lights ---
+        const ambientLight = new THREE.AmbientLight(0x404040, 2); // Soft white light
+        scene.add(ambientLight);
+        
+        const pointLight = new THREE.PointLight(0xffffff, 2, 100);
+        pointLight.position.set(10, 10, 10);
+        scene.add(pointLight);
+
+        const controls = new OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+
+        // --- Post Processing (Bloom) ---
+        const renderScene = new RenderPass(scene, camera);
+        const bloomPass = new UnrealBloomPass(new THREE.Vector2(window.innerWidth, window.innerHeight), 1.5, 0.4, 0.85);
+        bloomPass.threshold = 0;
+        bloomPass.strength = 1.2; // Glow strength
+        bloomPass.radius = 0.5;
+
+        const composer = new EffectComposer(renderer);
+        composer.addPass(renderScene);
+        composer.addPass(bloomPass);
+
+        // --- Objects Container ---
+        const neuronMeshes = {}; // id -> mesh
+        const synapseLines = []; // list of lines
+        const neuronsData = {}; // id -> state
+
+        // --- Raycaster for Selection ---
+        const raycaster = new THREE.Raycaster();
+        const pointer = new THREE.Vector2();
+
+        window.addEventListener('pointerdown', onPointerDown);
+
+        function onPointerDown(event) {
+            pointer.x = (event.clientX / window.innerWidth) * 2 - 1;
+            pointer.y = -(event.clientY / window.innerHeight) * 2 + 1;
+
+            raycaster.setFromCamera(pointer, camera);
+            const intersects = raycaster.intersectObjects(Object.values(neuronMeshes));
+
+            if (intersects.length > 0) {
+                const id = parseInt(intersects[0].object.name.split('_')[1]);
+                selectedNeuronId = id;
+                document.getElementById('selected-neuron').innerText = `Selected: Neuron ${id}`;
+                // Visual feedback
+                Object.values(neuronMeshes).forEach(m => m.material.emissiveIntensity = 0.5);
+                intersects[0].object.material.emissiveIntensity = 2.0;
+                
+                // Update UI immediately
+                updateTooltip();
+            }
+        }
+
+        // --- Visualization Logic ---
+        
+        // Colors
+        const COLOR_HEALTHY = 0x00ff00;
+        const COLOR_DEAD = 0xff0000;
+        const COLOR_BACKUP = 0x0088ff;
+        const COLOR_HEALING = 0xffff00;
+        const COLOR_INPUT = 0xaaaaaa;
+
+        function updateScene(state) {
+            // 1. Identify all unique neurons (Inputs + Hidden/Backup + Output) to map to Sphere
+            
+            // Get Inputs from synapses source
+            const inputs = new Set();
+            state.synapses.forEach(s => {
+                if(s.source.startsWith('in_')) inputs.add(s.source);
+            });
+            const inputIds = Array.from(inputs).sort();
+            
+            // Real neurons
+            const realNeurons = state.neurons;
+            
+            // Total count for sphere distribution
+            const totalCount = inputIds.length + realNeurons.length;
+            
+            // We need a stable index for each ID to keep position constant
+            // Let's reuse the mesh determination logic. 
+            // If it's a new neuron, assign it the next available slot on the sphere.
+            
+            // Combine all IDs
+            const allIds = [...inputIds, ...realNeurons.map(n => `neuron_${n.id}`)];
+            
+            // Radius of the sphere
+            const radius = 10;
+            const phi = Math.PI * (3 - Math.sqrt(5)); // Golden angle
+
+            allIds.forEach((id, i) => {
+                if (!neuronMeshes[id]) {
+                    const geo = new THREE.SphereGeometry(0.5, 32, 32);
+                    const mat = new THREE.MeshStandardMaterial({ 
+                        color: COLOR_HEALTHY, 
+                        emissive: COLOR_HEALTHY, 
+                        emissiveIntensity: 0.5,
+                        roughness: 0.2,
+                        metalness: 0.8
+                    });
+                    const mesh = new THREE.Mesh(geo, mat);
+                    mesh.name = id;
+                    
+                    // Fibonacci Sphere Distribution
+                    const y = 1 - (i / (totalCount - 1)) * 2; // y goes from 1 to -1
+                    const radiusAtY = Math.sqrt(1 - y * y); // radius at y
+                    const theta = phi * i; // golden angle increment
+
+                    const x = Math.cos(theta) * radiusAtY;
+                    const z = Math.sin(theta) * radiusAtY;
+
+                    mesh.position.set(x * radius, y * radius, z * radius);
+                    mesh.lookAt(0, 0, 0); // Face center? Or outward? Let's leave as sphere.
+                    
+                    scene.add(mesh);
+                    neuronMeshes[id] = mesh;
+                }
+                
+                // Update Appearance
+                const mesh = neuronMeshes[id];
+                let color = new THREE.Color(COLOR_HEALTHY);
+                let potential = 0;
+                let threshold = 1;
+                let health = 1.0;
+
+                if (id.startsWith('in_')) {
+                     color.setHex(0x00ffff); // Cyan for inputs
+                     mesh.scale.setScalar(0.8);
+                } else {
+                    // It's a real neuron
+                    const nid = parseInt(id.split('_')[1]);
+                    const nState = realNeurons.find(n => n.id === nid);
+                    
+                    if (nState) {
+                        health = nState.health;
+                        potential = nState.potential;
+                        threshold = nState.threshold;
+                        neuronsData[nid] = nState; // Update cache
+
+                        // Color Logic
+                        if (nState.is_healing) {
+                            // Pulsing Yellow/Orange for Healing
+                            // Use progress to fade from Red (start) to Green (end)?
+                            // Or just Yellow.
+                            const hue = 0.1 + (nState.healing_progress * 0.2); // Orange (0.1) to Yellow/Greenish (0.3)
+                            color.setHSL(hue, 1.0, 0.5);
+                        }
+                        else if (nState.fault === "Dead" || !nState.is_active) {
+                            if (nState.is_backup && !nState.is_active) {
+                                color.setHex(COLOR_BACKUP); // Inactive Backup
+                            } else {
+                                color.setHex(COLOR_DEAD); // Dead
+                            }
+                        } else {
+                            // Active Normal
+                             if (health >= 0.5) {
+                                // Green to Yellow
+                                color.setHSL(0.33 * ((health - 0.5) * 2), 1.0, 0.5); 
+                            } else {
+                                // Yellow to Reddish
+                                color.setHSL(0.16 * (health * 2), 1.0, 0.5);
+                            }
+
+                            // Scar Tissue Tint (Orange overlay)
+                            if (nState.scar_tissue > 0) {
+                                const scarIntensity = Math.min(nState.scar_tissue * 0.2, 0.8); // Max 80% orange
+                                const scarColor = new THREE.Color(0xff8800); // Orange
+                                color.lerp(scarColor, scarIntensity);
+                            }
+                        }
+                    }
+                }
+                
+                // Pulse Logic
+                let intensity = 0.3;
+                if (!id.startsWith('in_')) {
+                    const activity = Math.max(0, potential / threshold);
+                    intensity = 0.3 + (activity * 2.0);
+                    
+                    // Extra pulse for healing
+                    if (id !== selectedNeuronId && neuronsData[parseInt(id.split('_')[1])]?.is_healing) {
+                         intensity = 0.8 + Math.sin(Date.now() * 0.01) * 0.4;
+                    }
+
+                    const scale = 1 + (activity * 0.5);
+                    mesh.scale.setScalar(scale);
+                }
+
+                mesh.material.color.copy(color);
+                mesh.material.emissive.copy(color);
+                mesh.material.emissiveIntensity = intensity;
+            });
+
+
+
+            // Update Tooltip if selected
+            updateTooltip();
+
+            // 2. Update Synapses
+            let lineIdx = 0;
+            state.synapses.forEach(syn => {
+                const srcId = syn.source;
+                const tgtId = `neuron_${syn.target}`;
+                
+                const srcMesh = neuronMeshes[srcId];
+                const tgtMesh = neuronMeshes[tgtId];
+                
+                if (srcMesh && tgtMesh) {
+                    let line = synapseLines[lineIdx];
+                    if (!line) {
+                        const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]);
+                        const mat = new THREE.LineBasicMaterial({ 
+                            color: 0xffffff, 
+                            transparent: true, 
+                            opacity: 0.1,
+                            blending: THREE.AdditiveBlending 
+                        });
+                        line = new THREE.Line(geo, mat);
+                        scene.add(line);
+                        synapseLines.push(line);
+                    }
+                    
+                    const positions = line.geometry.attributes.position.array;
+                    srcMesh.position.toArray(positions, 0);
+                    tgtMesh.position.toArray(positions, 3);
+                    line.geometry.attributes.position.needsUpdate = true;
+                    
+                    line.visible = true;
+                    // Opacity based on weight and source activity?
+                    // For now just weight.
+                    line.material.opacity = syn.weight * 0.8; 
+                    line.material.color.setHex(srcMesh.material.color.getHex()); // Inherit source color
+                    lineIdx++;
+                }
+            });
+            
+            // Hide unused lines
+            for (let i = lineIdx; i < synapseLines.length; i++) {
+                synapseLines[i].visible = false;
+            }
+        }
+        
+        function updateTooltip() {
+            if (selectedNeuronId !== null && neuronsData[selectedNeuronId]) {
+                const n = neuronsData[selectedNeuronId];
+                const type = n.is_backup ? (n.is_active ? "Backup (Active)" : "Backup (Idle)") : "Hidden";
+                
+                // Health Color
+                let healthColor = "#00ff00";
+                if (n.health < 0.5) healthColor = "#ff0000";
+                else if (n.health < 1.0) healthColor = "#ffff00";
+
+                let healingHtml = "";
+                if (n.is_healing) {
+                    healingHtml = `
+                    <div style="margin-bottom: 5px;">
+                        <span style="font-size: 12px; color: #fe0;">Healing Progress: ${(n.healing_progress * 100).toFixed(0)}%</span>
+                        <div style="width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 2px;">
+                            <div style="width: ${n.healing_progress * 100}%; height: 100%; background: #fe0; transition: width 0.1s;"></div>
+                        </div>
+                    </div>`;
+                }
+
+                document.getElementById('neuron-info').innerHTML = `
+                    <div style="background: rgba(50,50,50,0.8); padding: 10px; border-radius: 5px; border: 1px solid #555;">
+                        <h3 style="margin: 0 0 5px 0; color: #fff;">Neuron ${n.id}</h3>
+                        <div style="font-size: 12px; margin-bottom: 5px;">Type: <span style="color: #acf;">${type}</span></div>
+                        <div style="font-size: 12px; margin-bottom: 5px;">Status: <span style="font-weight: bold; color: ${n.fault === 'Healthy' ? '#afa' : (n.is_healing ? '#fe0' : '#faa')}">${n.fault}</span></div>
+                        
+                        <div style="margin-bottom: 5px;">
+                            <span style="font-size: 12px;">Health: ${(n.health * 100).toFixed(0)}%</span>
+                            <div style="width: 100%; height: 8px; background: #333; border-radius: 4px; overflow: hidden; margin-top: 2px;">
+                                <div style="width: ${n.health * 100}%; height: 100%; background: ${healthColor}; transition: width 0.3s;"></div>
+                            </div>
+                        </div>
+                        
+                        ${healingHtml}
+
+                        <div style="font-size: 12px;">Scar Tissue: <span style="color: #fa0;">${n.scar_tissue || 0}</span></div>
+                        <div style="font-size: 12px;">Voltage: ${n.potential.toFixed(2)} / ${n.threshold.toFixed(2)}</div>
+                    </div>
+                `;
+            } else if (selectedNeuronId !== null && selectedNeuronId.toString().startsWith('in')) {
+                 document.getElementById('neuron-info').innerHTML = `<strong>Input ${selectedNeuronId}</strong>`;
+            }
+        }
+
+        // --- Socket Events ---
+        socket.on('connect', () => {
+            console.log('Connected to server');
+        });
+
+        socket.on('snn_update', (state) => {
+            updateScene(state);
+            updateLogs(state.logs);
+            updateEnergyGraph(state.energy || 0);
+        });
+        
+        socket.on('log_message', (data) => {
+            addLog(data.msg);
+        });
+
+        // --- UI Logic ---
+        document.getElementById('btn-toggle').onclick = () => {
+            isRunning = !isRunning;
+            document.getElementById('btn-toggle').innerText = isRunning ? "Stop Simulation" : "Start Simulation";
+            socket.emit('toggle_simulation', { running: isRunning });
+        };
+
+        document.getElementById('btn-reset').onclick = () => {
+            socket.emit('reset_network');
+            window.location.reload(); 
+        };
+
+        window.injectFault = (type) => {
+            if (selectedNeuronId === null) {
+                alert("Please select a neuron first by clicking on it.");
+                return;
+            }
+            socket.emit('inject_fault', { id: selectedNeuronId, type: type });
+        };
+
+        function updateLogs(serverLogs) {
+             if (serverLogs && serverLogs.length > 0) {
+                 const logDiv = document.getElementById('logs');
+                 logDiv.innerHTML = ""; 
+                 serverLogs.forEach(l => {
+                     const div = document.createElement('div');
+                     div.className = 'log-entry';
+                     div.innerText = l;
+                     logDiv.appendChild(div);
+                 });
+                 logDiv.scrollTop = logDiv.scrollHeight;
+             }
+        }
+        
+        function addLog(msg) {
+             const logDiv = document.getElementById('logs');
+             const div = document.createElement('div');
+             div.className = 'log-entry';
+             div.innerText = `[System] ${msg}`;
+             logDiv.appendChild(div);
+             logDiv.scrollTop = logDiv.scrollHeight;
+        }
+
+        // --- Energy Graph Logic ---
+        const energyHistory = new Array(100).fill(0);
+        const energyCanvas = document.getElementById('energy-graph');
+        const energyCtx = energyCanvas.getContext('2d');
+
+        function updateEnergyGraph(currentEnergy) {
+            energyHistory.shift();
+            energyHistory.push(currentEnergy);
+
+            const w = energyCanvas.width;
+            const h = energyCanvas.height;
+            energyCtx.clearRect(0, 0, w, h);
+
+            energyCtx.beginPath();
+            energyCtx.strokeStyle = '#00ffcc';
+            energyCtx.lineWidth = 2;
+
+            const maxVal = Math.max(...energyHistory, 10); // Auto-scale, min 10
+            
+            for (let i = 0; i < energyHistory.length; i++) {
+                const val = energyHistory[i];
+                const x = (i / (energyHistory.length - 1)) * w;
+                const y = h - ((val / maxVal) * h);
+                
+                if (i === 0) energyCtx.moveTo(x, y);
+                else energyCtx.lineTo(x, y);
+            }
+            energyCtx.stroke();
+            
+            // Draw current value text
+            energyCtx.fillStyle = '#fff';
+            energyCtx.font = '10px sans-serif';
+            energyCtx.fillText(currentEnergy.toFixed(0), w - 20, 10);
+        }
+
+        // --- Animation Loop ---
+        const group = new THREE.Group();
+        scene.add(group);
+        // Move all meshes into group? 
+        // Logic above adds to scene directly. 
+        // Let's rotate the camera container or scene.
+        // Easier: Rotate the camera around the center.
+        
+        let angle = 0;
+        const radius = 25; // Camera radius
+
+        function animate() {
+            requestAnimationFrame(animate);
+            controls.update(); // OrbitControls handles camera
+            
+            // Slow auto-rotation if not interacting?
+            // controls.autoRotate = true; 
+            // controls.autoRotateSpeed = 2.0;
+            
+            // Or rotate the scene content if we group it.
+            // Since we add directly to scene, let's just use OrbitControls autoRotate.
+            controls.autoRotate = true;
+            controls.autoRotateSpeed = 1.0;
+
+            composer.render();
+        }
+        animate();
+
+        // Handle Window Resize
+        window.addEventListener('resize', onWindowResize, false);
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            composer.setSize(window.innerWidth, window.innerHeight);
+        }
+        
+    </script>
+</body>
+</html>
